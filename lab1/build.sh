@@ -35,7 +35,7 @@ exit_handler() {
 trap exit_handler EXIT HUP INT QUIT PIPE TERM
 
 # Переходим во временный каталог
-cd "$tmpDir" || exit 1
+cd "$tmpDir"
 
 ext="${abs_file##*.}"
 
