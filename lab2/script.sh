@@ -21,7 +21,6 @@ echo "Контейнер $CONTAINER_ID запущен."
 while true; do
     FILE_COUNTER=$((FILE_COUNTER + 1))
 
-
     exec 200>"$LOCK_FILE"
     flock -x 200
 
