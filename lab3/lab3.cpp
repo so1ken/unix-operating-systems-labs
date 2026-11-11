@@ -4,17 +4,17 @@
 #include <fstream>
 #include <sstream>
 #include <iomanip>
-#include <openssl/sha.h>
+#include <openssl/evp.h>
 #include <unistd.h>
 #include <cstring>
 #include <cerrno>
 #include <cstdlib>
-#include <openssl/evp.h>
+#include <sys/stat.h> 
 
 using namespace std;
 namespace fs = filesystem;
 
-// Функция обработки ошибок
+// Функция обработки фатальных ошибок
 void die(const string& msg, int code = 1) {
     cerr << "Ошибка: " << msg << "\n";
     exit(code);
@@ -28,13 +28,9 @@ string get_sha1(const fs::path& filepath) {
         return "";
     }
 
-    // Создаем контекст для хэширования
     EVP_MD_CTX* ctx = EVP_MD_CTX_new();
-    if (!ctx) {
-        die("не удалось создать контекст EVP");
-    }
+    if (!ctx) die("не удалось создать контекст EVP");
 
-    // Инициализируем контекст алгоритмом SHA-1
     if (EVP_DigestInit_ex(ctx, EVP_sha1(), nullptr) != 1) {
         EVP_MD_CTX_free(ctx);
         die("не удалось инициализировать SHA-1");
@@ -51,13 +47,11 @@ string get_sha1(const fs::path& filepath) {
     unsigned char hash[EVP_MAX_MD_SIZE];
     unsigned int lengthOfHash = 0;
 
-    // Завершаем хэширование и получаем результат
     if (EVP_DigestFinal_ex(ctx, hash, &lengthOfHash) != 1) {
         EVP_MD_CTX_free(ctx);
         die("не удалось завершить хэширование");
     }
 
-    // Освобождаем память
     EVP_MD_CTX_free(ctx);
 
     stringstream ss;
@@ -85,7 +79,7 @@ int main(int argc, char* argv[]) {
 
     try {
         for (const auto& entry : fs::recursive_directory_iterator(root_dir)) {
-            if (!entry.is_regular_file()) continue;
+            if (!fs::is_regular_file(entry.symlink_status())) continue;
 
             fs::path filepath = entry.path();
             string hash = get_sha1(filepath);
@@ -93,27 +87,44 @@ int main(int argc, char* argv[]) {
             if (hash.empty()) continue;
 
             if (hash_map.find(hash) != hash_map.end()) {
-                // Нашли дубликат
                 fs::path original = hash_map[hash];
+            
+                struct stat stat_orig, stat_dup;
+                if (stat(original.c_str(), &stat_orig) == 0 && 
+                    lstat(filepath.c_str(), &stat_dup) == 0) {
+                    
+                    if (stat_orig.st_dev == stat_dup.st_dev && 
+                        stat_orig.st_ino == stat_dup.st_ino) {
+                        continue;
+                    }
+                    if (stat_orig.st_dev != stat_dup.st_dev) {
+                        cerr << "Пропуск (разные ФС): " << filepath << "\n";
+                        continue;
+                    }
+                }
+
                 cout << "Найден дубликат: " << filepath << " == " << original << "\n";
 
-                if (unlink(filepath.c_str()) != 0) {
-                    die("не удалось удалить " + filepath.string() + ": " + strerror(errno));
-                }
-                
-                if (link(original.c_str(), filepath.c_str()) != 0) {
-                    die("не удалось создать ссылку " + filepath.string() + ": " + strerror(errno));
-                }
+                fs::path tmp_path = filepath;
+                tmp_path += ".link.tmp";
 
-                cout << "  -> Заменен на жесткую ссылку.\n";
-                duplicates_found++;
+                if (link(original.c_str(), tmp_path.c_str()) == 0) {
+                    if (rename(tmp_path.c_str(), filepath.c_str()) == 0) {
+                        cout << "  -> Заменен на жесткую ссылку.\n";
+                        duplicates_found++;
+                    } else {
+                        cerr << "  -> Ошибка rename: " << strerror(errno) << "\n";
+                        unlink(tmp_path.c_str());
+                    }
+                } else {
+                    cerr << "  -> Ошибка link: " << strerror(errno) << "\n";
+                }
             } else {
-                // Запоминаем как оригинал
                 hash_map[hash] = filepath;
             }
         }
     } catch (const fs::filesystem_error& e) {
-        die("ошибка обхода директории: " + string(e.what()));
+        cerr << "Ошибка обхода директории: " << e.what() << "\n";
     }
 
     cout << "\nГотово. Обработано дубликатов: " << duplicates_found << "\n";
