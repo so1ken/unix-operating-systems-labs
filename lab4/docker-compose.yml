@@ -1,0 +1,53 @@
+name: distributed-calculator
+
+services:
+  rabbitmq:
+    image: rabbitmq:4-management
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: calculator
+      RABBITMQ_DEFAULT_PASS: calculator_password
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  api:
+    build: .
+    command: ["python", "api.py"]
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_USER: calculator
+      RABBITMQ_PASSWORD: calculator_password
+      TASK_QUEUE: calculations
+      RESPONSE_TIMEOUT: "15"
+    ports:
+      - "8000:8000"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: ["python", "worker.py"]
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_USER: calculator
+      RABBITMQ_PASSWORD: calculator_password
+      TASK_QUEUE: calculations
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  rabbitmq_data:
