@@ -1,214 +1,154 @@
-#include <cerrno>
-#include <cstdlib>
 #include <iostream>
-#include <new>
-#include <pthread.h>
 #include <string>
-#include <utility>
-#include <time.h>
+#include <pthread.h>
+#include <unistd.h>
 
 class Event {
 public:
-    Event(unsigned int id, std::string payload)
-        : id_(id), payload_(std::move(payload)) {}
+    int id;
+    std::string payload;
 
-    unsigned int id() const { return id_; }
-    const std::string& payload() const { return payload_; }
-
-private:
-    unsigned int id_;
-    std::string payload_;
+    Event(int id) {
+        this->id = id;
+        payload = "message " + std::to_string(id);
+    }
 };
 
 class Monitor {
-public:
-    Monitor() : event_(nullptr), ready_(false), stopping_(false) {
-        int error = pthread_mutex_init(&mutex_, nullptr);
-        if (error != 0) {
-            throw error;
-        }
+private:
+    pthread_mutex_t mutex;
+    pthread_cond_t condition;
 
-        error = pthread_cond_init(&condition_, nullptr);
-        if (error != 0) {
-            pthread_mutex_destroy(&mutex_);
-            throw error;
-        }
+    Event* data = nullptr;
+    bool ready = false;
+    bool stopping = false;
+
+public:
+    Monitor() {
+        pthread_mutex_init(&mutex, nullptr);
+        pthread_cond_init(&condition, nullptr);
     }
 
     ~Monitor() {
-        delete event_;
-        pthread_cond_destroy(&condition_);
-        pthread_mutex_destroy(&mutex_);
+        delete data;
+        pthread_mutex_destroy(&mutex);
+        pthread_cond_destroy(&condition);
     }
 
-    Monitor(const Monitor&) = delete;
-    Monitor& operator=(const Monitor&) = delete;
+    void provide(Event* event) {
+        pthread_mutex_lock(&mutex);
 
-    // Передаёт владение объектом монитору. Объект не сериализуется:
-    // между потоками передаётся обычный указатель на экземпляр Event.
-    bool provide(Event* event) {
-        pthread_mutex_lock(&mutex_);
-
-        while (ready_ && !stopping_) {
-            pthread_cond_wait(&condition_, &mutex_);
+        while (ready && !stopping) {
+            pthread_cond_wait(&condition, &mutex);
         }
 
-        if (stopping_) {
-            pthread_mutex_unlock(&mutex_);
-            return false;
+        if (stopping) {
+            pthread_mutex_unlock(&mutex);
+            return;
         }
 
-        event_ = event;
-        ready_ = true;
+        data = event;
+        ready = true;
 
-        std::cout << "Поставщик: отправлено событие #" << event_->id()
-                  << ", указатель " << static_cast<void*>(event_) << std::endl;
+        std::cout << "Producer: отправил событие "
+                  << event->id << std::endl;
 
-        pthread_cond_signal(&condition_);
-        pthread_mutex_unlock(&mutex_);
-        return true;
+        pthread_cond_signal(&condition);
+        pthread_mutex_unlock(&mutex);
     }
 
-    // Потребитель получает указатель и становится владельцем объекта.
     Event* consume() {
-        pthread_mutex_lock(&mutex_);
+        pthread_mutex_lock(&mutex);
 
-        while (!ready_ && !stopping_) {
-            pthread_cond_wait(&condition_, &mutex_);
+        while (!ready && !stopping) {
+            pthread_cond_wait(&condition, &mutex);
         }
 
-        if (!ready_ && stopping_) {
-            pthread_mutex_unlock(&mutex_);
+        if (!ready) {
+            pthread_mutex_unlock(&mutex);
             return nullptr;
         }
 
-        Event* event = event_;
-        event_ = nullptr;
-        ready_ = false;
+        Event* event = data;
+        data = nullptr;
+        ready = false;
 
-        std::cout << "Потребитель: получено событие #" << event->id()
-                  << ", данные: \"" << event->payload() << "\""
+        std::cout << "Consumer: получил событие "
+                  << event->id << " (" << event->payload << ")"
                   << std::endl;
 
-        pthread_cond_signal(&condition_);
-        pthread_mutex_unlock(&mutex_);
+        pthread_cond_signal(&condition);
+        pthread_mutex_unlock(&mutex);
+
         return event;
     }
 
     void stop() {
-        pthread_mutex_lock(&mutex_);
-        stopping_ = true;
-        pthread_cond_broadcast(&condition_);
-        pthread_mutex_unlock(&mutex_);
+        pthread_mutex_lock(&mutex);
+        stopping = true;
+        pthread_cond_broadcast(&condition);
+        pthread_mutex_unlock(&mutex);
     }
-
-private:
-    pthread_mutex_t mutex_{};
-    pthread_cond_t condition_{};
-    Event* event_;
-    bool ready_;
-    bool stopping_;
 };
 
 struct ThreadArgs {
     Monitor* monitor;
-    unsigned int event_count;
+    int event_count;
 };
 
-static void sleep_one_second() {
-    timespec remaining{1, 0};
-    while (nanosleep(&remaining, &remaining) == -1 && errno == EINTR) {
-    }
-}
+void* producer(void* arg) {
+    ThreadArgs* args = (ThreadArgs*)arg;
 
-static void* producer_thread(void* raw_args) {
-    auto* args = static_cast<ThreadArgs*>(raw_args);
+    for (int id = 1; id <= args->event_count; id++) {
+        sleep(1);
 
-    for (unsigned int id = 1; id <= args->event_count; ++id) {
-        sleep_one_second();
-
-        Event* event = nullptr;
-        try {
-            event = new Event(id, "произвольный объект с данными события " +
-                                      std::to_string(id));
-        } catch (const std::bad_alloc&) {
-            std::cerr << "Поставщик: не удалось выделить память для события" << std::endl;
-            break;
-        }
-
-        if (!args->monitor->provide(event)) {
-            delete event;
-            break;
-        }
+        Event* event = new Event(id);
+        args->monitor->provide(event);
     }
 
     return nullptr;
 }
 
-static void* consumer_thread(void* raw_args) {
-    auto* args = static_cast<ThreadArgs*>(raw_args);
+void* consumer(void* arg) {
+    Monitor* monitor = (Monitor*)arg;
 
     while (true) {
-        Event* event = args->monitor->consume();
+        Event* event = monitor->consume();
+
         if (event == nullptr) {
             break;
         }
 
-        // После consume() потребитель владеет объектом и освобождает его.
         delete event;
     }
 
     return nullptr;
 }
 
-static bool parse_event_count(const char* text, unsigned int* result) {
-    char* end = nullptr;
-    errno = 0;
-    const unsigned long value = std::strtoul(text, &end, 10);
+int main() {
+    Monitor monitor;
+    ThreadArgs args{&monitor, 5};
 
-    if (errno != 0 || end == text || *end != '\0' || value == 0 || value > 1000) {
-        return false;
+    pthread_t producerThread;
+    pthread_t consumerThread;
+
+    if (pthread_create(&consumerThread, nullptr, consumer, &monitor) != 0) {
+        std::cerr << "Ошибка создания consumer" << std::endl;
+        return 1;
     }
 
-    *result = static_cast<unsigned int>(value);
-    return true;
-}
-
-int main(int argc, char** argv) {
-    unsigned int event_count = 10;
-    if (argc > 2 || (argc == 2 && !parse_event_count(argv[1], &event_count))) {
-        std::cerr << "Использование: " << argv[0] << " [количество_событий_1..1000]"
-                  << std::endl;
-        return EXIT_FAILURE;
-    }
-
-    try {
-        Monitor monitor;
-        ThreadArgs args{&monitor, event_count};
-        pthread_t consumer{};
-        pthread_t producer{};
-
-        int error = pthread_create(&consumer, nullptr, consumer_thread, &args);
-        if (error != 0) {
-            std::cerr << "pthread_create (потребитель): " << error << std::endl;
-            return EXIT_FAILURE;
-        }
-
-        error = pthread_create(&producer, nullptr, producer_thread, &args);
-        if (error != 0) {
-            std::cerr << "pthread_create (поставщик): " << error << std::endl;
-            monitor.stop();
-            pthread_join(consumer, nullptr);
-            return EXIT_FAILURE;
-        }
-
-        pthread_join(producer, nullptr);
+    if (pthread_create(&producerThread, nullptr, producer, &args) != 0) {
         monitor.stop();
-        pthread_join(consumer, nullptr);
-    } catch (int error) {
-        std::cerr << "Ошибка инициализации pthread: " << error << std::endl;
-        return EXIT_FAILURE;
+        pthread_join(consumerThread, nullptr);
+        std::cerr << "Ошибка создания producer" << std::endl;
+        return 1;
     }
 
-    return EXIT_SUCCESS;
+    pthread_join(producerThread, nullptr);
+
+    monitor.stop();
+
+    pthread_join(consumerThread, nullptr);
+
+    return 0;
 }
