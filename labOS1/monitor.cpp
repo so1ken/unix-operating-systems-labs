@@ -1,6 +1,6 @@
 #include <iostream>
-#include <string>
 #include <pthread.h>
+#include <string>
 #include <unistd.h>
 
 class Event {
@@ -44,6 +44,7 @@ public:
 
         if (stopping) {
             pthread_mutex_unlock(&mutex);
+            delete event;
             return;
         }
 
@@ -110,10 +111,10 @@ void* producer(void* arg) {
 }
 
 void* consumer(void* arg) {
-    Monitor* monitor = (Monitor*)arg;
+    ThreadArgs* args = (ThreadArgs*)arg;
 
     while (true) {
-        Event* event = monitor->consume();
+        Event* event = args->monitor->consume();
 
         if (event == nullptr) {
             break;
@@ -125,14 +126,32 @@ void* consumer(void* arg) {
     return nullptr;
 }
 
-int main() {
+int main(int argc, char* argv[]) {
+    int event_count = 5;
+
+    if (argc > 2) {
+        std::cerr << "Использование: ./monitor [количество событий]"
+                  << std::endl;
+        return 1;
+    }
+
+    if (argc == 2) {
+        event_count = std::stoi(argv[1]);  
+    }
+
+    if (event_count < 1 || event_count > 1000) {
+        std::cerr << "Количество событий должно быть от 1 до 1000"
+                  << std::endl;
+        return 1;
+    }
+
     Monitor monitor;
-    ThreadArgs args{&monitor, 5};
+    ThreadArgs args{&monitor, event_count};
 
     pthread_t producerThread;
     pthread_t consumerThread;
 
-    if (pthread_create(&consumerThread, nullptr, consumer, &monitor) != 0) {
+    if (pthread_create(&consumerThread, nullptr, consumer, &args) != 0) {
         std::cerr << "Ошибка создания consumer" << std::endl;
         return 1;
     }
